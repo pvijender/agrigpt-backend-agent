@@ -1,6 +1,10 @@
 """
-FastAPI + LangGraph Agent with Remote MCP Tool Discovery
+FastAPI + LangGraph Agent with Multi-MCP Tool Discovery
 WhatsApp Business API (Meta Cloud API) Webhook Handler
+
+Connects to MULTIPLE MCP servers simultaneously (e.g. Alumnx + Vignan)
+and merges all their tools into one agent dynamically at startup.
+
 New Chat flow:
   - Frontend generates a new UUID on "New Chat" click and sends it as chat_id.
   - Backend finds no history for that chat_id → agent starts fresh.
@@ -39,18 +43,38 @@ load_dotenv()
 langsmith_api_key = os.getenv("LANGSMITH_API_KEY")
 if langsmith_api_key:
     os.environ["LANGCHAIN_TRACING_V2"] = "true"
-    os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
-    os.environ["LANGCHAIN_API_KEY"] = langsmith_api_key
-    os.environ["LANGCHAIN_PROJECT"] = "agrigpt-backend-agent"
+    os.environ["LANGCHAIN_ENDPOINT"]   = "https://api.smith.langchain.com"
+    os.environ["LANGCHAIN_API_KEY"]    = langsmith_api_key
+    os.environ["LANGCHAIN_PROJECT"]    = "agrigpt-backend-agent"
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-MCP_BASE_URL   = os.getenv("MCP_BASE_URL", "https://newapi.alumnx.com/agrigpt/mcp/")
-MCP_API_KEY    = os.getenv("MCP_API_KEY")
-MCP_TIMEOUT    = 30.0
+MCP_TIMEOUT    = float(os.getenv("MCP_TIMEOUT", "30"))
+
+# ── Multi-MCP Configuration ──────────────────────────────────────────────────
+# Each MCP server is configured via its own pair of env vars:
+#   <NAME>_MCP_URL      → base URL of that server
+#   <NAME>_MCP_API_KEY  → optional Bearer token (leave blank if not needed)
+#
+# The agent contacts ALL servers at startup, discovers their tools, and
+# merges everything into a single LangGraph agent automatically.
+# To add a third server later, just add its env vars and a new entry below.
+# ─────────────────────────────────────────────────────────────────────────────
+MCP_SERVERS: List[Dict[str, str]] = [
+    {
+        "name":    "Alumnx",
+        "url":     os.getenv("ALUMNX_MCP_URL", "http://localhost:9000"),
+        "api_key": os.getenv("ALUMNX_MCP_API_KEY", ""),
+    },
+    {
+        "name":    "Vignan",
+        "url":     os.getenv("VIGNAN_MCP_URL", "http://localhost:8000"),
+        "api_key": os.getenv("VIGNAN_MCP_API_KEY", ""),
+    },
+]
 
 MONGODB_URI        = os.getenv("MONGODB_URI")
 MONGODB_DB         = os.getenv("MONGODB_DB", "agrigpt")
-MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "chats")  # fresh collection, new schema
+MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "chats")
 
 # Max messages stored per chat_id (human + AI combined = 10 full turns).
 # The LLM receives ALL stored messages as context on every invocation.
@@ -68,13 +92,12 @@ mongo_client   = MongoClient(MONGODB_URI)
 db             = mongo_client[MONGODB_DB]
 chat_sessions: Collection = db[MONGODB_COLLECTION]
 
-# Indexes
 # chat_id      → unique  (one document per conversation session)
 # phone_number → non-unique (one user can have many chat sessions)
 # updated_at   → for future TTL / cleanup
-chat_sessions.create_index([("chat_id", ASCENDING)], unique=True)
+chat_sessions.create_index([("chat_id",      ASCENDING)], unique=True)
 chat_sessions.create_index([("phone_number", ASCENDING)])
-chat_sessions.create_index([("updated_at", ASCENDING)])
+chat_sessions.create_index([("updated_at",   ASCENDING)])
 
 print(f"Connected to MongoDB: {MONGODB_DB}.{MONGODB_COLLECTION}")
 
@@ -121,12 +144,8 @@ def save_history(chat_id: str, messages: list, phone_number: str | None = None):
          always ending on a complete human+AI pair.
       3. Upsert the document — creates it on first save (new chat),
          updates it on subsequent saves (continuing chat).
-
-    phone_number is stored as a metadata field so you can later query
-    all chat sessions for a specific user:
-      db.chat_sessions_v2.find({ phone_number: "911234567890" })
     """
-    # Step 1: Filter to storable human/ai messages only
+    # Step 1 — filter to storable human/ai messages only
     storable = []
     for msg in messages:
         if isinstance(msg, HumanMessage):
@@ -147,9 +166,7 @@ def save_history(chat_id: str, messages: list, phone_number: str | None = None):
                     storable.append({"role": "ai", "content": joined})
         # ToolMessage and other internal types are intentionally skipped
 
-    # Step 2: Pair-aware sliding window
-    # Walk backwards collecting complete human+AI pairs until MAX_MESSAGES is reached.
-    # This guarantees the stored history always ends on an AI reply (no dangling human turns).
+    # Step 2 — pair-aware sliding window
     if len(storable) <= MAX_MESSAGES:
         window = storable
     else:
@@ -168,7 +185,7 @@ def save_history(chat_id: str, messages: list, phone_number: str | None = None):
 
         window = storable[cutoff_index:] if pairs_collected > 0 else storable[-MAX_MESSAGES:]
 
-    # Step 3: Upsert
+    # Step 3 — upsert
     now = datetime.now(timezone.utc)
     update_fields: dict = {
         "messages":   window,
@@ -181,43 +198,102 @@ def save_history(chat_id: str, messages: list, phone_number: str | None = None):
         {"chat_id": chat_id},
         {
             "$set":         update_fields,
-            "$setOnInsert": {"created_at": now},  # only set on first insert
+            "$setOnInsert": {"created_at": now},
         },
         upsert=True
     )
 
+
 # ============================================================
-# MCP Client
+# MCP Client — one instance per server
+#
+# Your MCP servers expose this custom REST API:
+#   GET  /list-tools  → {
+#                         "tools": [{
+#                           "name": "...",
+#                           "description": "...",
+#                           "parameters": {
+#                             "param_name": {
+#                               "type": "string",
+#                               "required": true/false,   ← inline bool, NOT a top-level array
+#                               "default": "...",
+#                               "description": "..."
+#                             }
+#                           }
+#                         }]
+#                       }
+#   POST /callTool    → { "name": "...", "arguments": {...} }
+#                     ← { "result": ... }
 # ============================================================
 class MCPClient:
-    def __init__(self, base_url: str, api_key: str | None = None):
+    """REST client matching your MCP servers' custom endpoint format."""
+
+    def __init__(self, name: str, base_url: str, api_key: str | None = None):
+        self.name     = name
         self.base_url = base_url.rstrip("/")
-        self.headers  = {"Content-Type": "application/json"}
-        self.client   = httpx.Client(timeout=MCP_TIMEOUT)
+        self.headers  = {"Content-Type": "application/json", "Accept": "application/json"}
+        if api_key:
+            self.headers["Authorization"] = f"Bearer {api_key}"
+        self.client = httpx.Client(timeout=MCP_TIMEOUT)
 
     def list_tools(self) -> List[Dict[str, Any]]:
-        print(f"Calling MCP server: {self.base_url}/getToolsList")
-        response = self.client.post(
-            f"{self.base_url}/getToolsList",
+        """
+        GET /list-tools and normalize the response into the internal format
+        that build_agent() expects:
+          { name, description, inputSchema: { properties: {...}, required: [...] } }
+
+        The server returns a flat "parameters" dict where each param carries
+        an inline "required" boolean. We convert that to a standard JSON Schema
+        shape so the rest of the agent code doesn't need to know about it.
+        """
+        print(f"[{self.name}] Fetching tools → {self.base_url}/list-tools")
+        response = self.client.get(
+            f"{self.base_url}/list-tools",
             headers=self.headers,
-            json={}
         )
         response.raise_for_status()
-        tools = response.json().get("tools", [])
-        print(f"Received {len(tools)} tools from MCP server")
-        return tools
+        raw_tools: List[Dict] = response.json().get("tools", [])
+
+        normalized = []
+        for tool in raw_tools:
+            params     = tool.get("parameters", {})
+            properties = {}
+            required   = []
+
+            for prop_name, prop_details in params.items():
+                properties[prop_name] = {
+                    "type":        prop_details.get("type", "string"),
+                    "description": prop_details.get("description", ""),
+                    "default":     prop_details.get("default", None),
+                }
+                # Server uses inline "required": true/false on each param
+                if prop_details.get("required", False):
+                    required.append(prop_name)
+
+            normalized.append({
+                "name":        tool["name"],
+                "description": tool.get("description", ""),
+                "inputSchema": {
+                    "properties": properties,
+                    "required":   required,
+                },
+            })
+
+        print(f"[{self.name}] Found {len(normalized)} tool(s): {[t['name'] for t in normalized]}")
+        return normalized
 
     def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
-        print(f"Calling MCP tool: {name} with args: {arguments}")
+        print(f"[{self.name}] Calling '{name}' | args: {arguments}")
         response = self.client.post(
             f"{self.base_url}/callTool",
             headers=self.headers,
-            json={"name": name, "arguments": arguments}
+            json={"name": name, "arguments": arguments},
         )
         response.raise_for_status()
         result = response.json().get("result")
-        print(f"MCP tool result: {result}")
+        print(f"[{self.name}] Result: {str(result)[:300]}")
         return result
+
 
 # ============================================================
 # LangGraph State
@@ -225,89 +301,140 @@ class MCPClient:
 class State(TypedDict):
     messages: Annotated[list, add_messages]
 
+
 # ============================================================
-# Agent Builder
+# Agent Builder — discovers & merges tools from ALL MCP servers
 # ============================================================
 def build_agent():
-    mcp_client   = MCPClient(MCP_BASE_URL, MCP_API_KEY)
-    print("Fetching tools from remote MCP...")
-    remote_tools = mcp_client.list_tools()
-    if not remote_tools:
-        raise RuntimeError("No tools found on remote MCP server.")
-    print(f"Loaded {len(remote_tools)} tools: {[t['name'] for t in remote_tools]}")
+    TYPE_MAP = {
+        "string":  str,
+        "integer": int,
+        "number":  float,
+        "boolean": bool,
+        "array":   list,
+        "object":  dict,
+    }
 
-    dynamic_tools = []
-    for tool_schema in remote_tools:
-        tool_name    = tool_schema["name"]
-        description  = tool_schema.get("description", "")
-        input_schema = tool_schema.get("inputSchema", {})
+    def wrap_tool(
+        client: MCPClient,
+        tool_name: str,
+        description: str,
+        input_schema: Dict[str, Any],
+    ) -> StructuredTool:
+        """
+        Wrap a single remote MCP tool as a LangChain StructuredTool.
+        `client` and `tool_name` are captured explicitly via default
+        arguments so every tool dispatches to the correct server even
+        when created inside a loop.
+        """
+        properties      = input_schema.get("properties", {})
+        required_fields = set(input_schema.get("required", []))
+        field_defs      = {}
 
-        def create_tool(name: str, desc: str, schema: Dict[str, Any]):
-            properties        = schema.get("properties", {})
-            field_definitions = {}
-            type_mapping = {
-                "string": str, "integer": int, "number": float,
-                "boolean": bool, "array": list, "object": dict
-            }
-            for prop_name, prop_details in properties.items():
-                py_type          = type_mapping.get(prop_details.get("type", "string"), str)
-                description_text = prop_details.get("description", "")
-                required         = prop_name in schema.get("required", [])
-                if required:
-                    field_definitions[prop_name] = (py_type, Field(..., description=description_text))
-                else:
-                    field_definitions[prop_name] = (
-                        py_type,
-                        Field(default=prop_details.get("default", None), description=description_text)
-                    )
+        for prop_name, prop_details in properties.items():
+            py_type   = TYPE_MAP.get(prop_details.get("type", "string"), str)
+            prop_desc = prop_details.get("description", "")
+            if prop_name in required_fields:
+                field_defs[prop_name] = (py_type, Field(..., description=prop_desc))
+            else:
+                field_defs[prop_name] = (
+                    py_type,
+                    Field(default=prop_details.get("default", None), description=prop_desc),
+                )
 
-            ArgsSchema = create_model(f"{name}_args", **field_definitions)
+        ArgsSchema = create_model(f"{tool_name}_args", **field_defs)
 
-            def remote_tool_func(**kwargs) -> str:
-                cleaned = {k: v for k, v in kwargs.items() if v is not None}
-                try:
-                    return str(mcp_client.call_tool(name, cleaned))
-                except Exception as e:
-                    import traceback; traceback.print_exc()
-                    return f"Remote MCP error: {str(e)}"
+        # Default-argument capture prevents late-binding bugs in loops
+        def remote_fn(_client=client, _name=tool_name, **kwargs) -> str:
+            cleaned = {k: v for k, v in kwargs.items() if v is not None}
+            try:
+                return str(_client.call_tool(_name, cleaned))
+            except Exception as exc:
+                import traceback; traceback.print_exc()
+                return f"[{_client.name}] MCP error calling '{_name}': {exc}"
 
-            return StructuredTool.from_function(
-                func=remote_tool_func,
-                name=name,
-                description=desc,
-                args_schema=ArgsSchema
-            )
+        return StructuredTool.from_function(
+            func=remote_fn,
+            name=tool_name,
+            description=f"[{client.name}] {description}",
+            args_schema=ArgsSchema,
+        )
 
-        dynamic_tools.append(create_tool(tool_name, description, input_schema))
+    # ── Discover tools from every configured MCP server ──────────────────────
+    all_tools:  List[StructuredTool] = []
+    seen_names: set                  = set()
 
-    llm            = ChatGoogleGenerativeAI(
+    for cfg in MCP_SERVERS:
+        client = MCPClient(
+            name=cfg["name"],
+            base_url=cfg["url"],
+            api_key=cfg.get("api_key") or None,
+        )
+        try:
+            remote_tools = client.list_tools()
+        except Exception as exc:
+            # One unreachable server must NOT crash the whole agent at startup
+            print(f"[{cfg['name']}] WARNING — could not reach server: {exc}")
+            continue
+
+        for schema in remote_tools:
+            raw_name     = schema["name"]
+            description  = schema.get("description", "")
+            input_schema = schema.get("inputSchema", {})
+
+            # Prefix with server name if two servers share the same tool name
+            unique_name = raw_name
+            if raw_name in seen_names:
+                unique_name = f"{cfg['name'].lower()}_{raw_name}"
+                print(
+                    f"[{cfg['name']}] Duplicate tool name '{raw_name}' "
+                    f"→ renamed to '{unique_name}'"
+                )
+            seen_names.add(unique_name)
+
+            all_tools.append(wrap_tool(client, unique_name, description, input_schema))
+
+    if not all_tools:
+        raise RuntimeError(
+            "No tools discovered from any MCP server. "
+            "Check that ALUMNX_MCP_URL and VIGNAN_MCP_URL are reachable."
+        )
+
+    print(f"\n✅ Total tools loaded: {len(all_tools)}")
+    print(f"   Tool names: {[t.name for t in all_tools]}\n")
+
+    # ── LLM ──────────────────────────────────────────────────────────────────
+    llm = ChatGoogleGenerativeAI(
         model="gemini-2.5-flash-lite",
         temperature=0,
-        google_api_key=GOOGLE_API_KEY
+        google_api_key=GOOGLE_API_KEY,
     )
-    llm_with_tools = llm.bind_tools(dynamic_tools)
+    llm_with_tools = llm.bind_tools(all_tools)
 
+    # ── LangGraph nodes ──────────────────────────────────────────────────────
     def agent_node(state: State):
         return {"messages": [llm_with_tools.invoke(state["messages"])]}
 
     def should_continue(state: State):
         last = state["messages"][-1]
-        return "tools" if hasattr(last, "tool_calls") and last.tool_calls else END
+        return "tools" if (hasattr(last, "tool_calls") and last.tool_calls) else END
 
     workflow = StateGraph(State)
     workflow.add_node("agent", agent_node)
-    workflow.add_node("tools", ToolNode(dynamic_tools))
+    workflow.add_node("tools", ToolNode(all_tools))
     workflow.add_edge(START, "agent")
     workflow.add_conditional_edges("agent", should_continue)
     workflow.add_edge("tools", "agent")
     return workflow.compile()
 
+
 # ============================================================
-# Startup
+# Startup — build the agent once at process start
 # ============================================================
 print("\nBUILDING AGENT AT STARTUP...")
 app_agent = build_agent()
 print("AGENT BUILD COMPLETE\n")
+
 
 # ============================================================
 # Core Agent Invocation — shared by ALL channels
@@ -332,18 +459,12 @@ def run_agent(chat_id: str, user_message: str, phone_number: str | None = None) 
 
     Flow:
       1. Load history for chat_id from MongoDB.
-         - New chat_id (from "New Chat" click) → empty history → fresh conversation.
+         - New chat_id → empty history → fresh conversation.
          - Existing chat_id → full history → agent remembers previous context.
       2. Append the new human message.
       3. Invoke the LLM with the full message history as context.
       4. Save updated history back to MongoDB (trimmed to MAX_MESSAGES).
       5. Return the final text answer.
-
-    Parameters
-    ----------
-    chat_id      : UUID from frontend. New UUID = new conversation. Same UUID = continued conversation.
-    user_message : The user's new message text.
-    phone_number : Stored as metadata on the MongoDB document (used to query all chats per user).
     """
     print(f"[run_agent] chat_id={chat_id} | phone={phone_number} | msg={user_message[:60]}")
 
@@ -360,6 +481,7 @@ def run_agent(chat_id: str, user_message: str, phone_number: str | None = None) 
 
     return final_answer
 
+
 # ============================================================
 # WhatsApp Sender (uncomment when Meta credentials are ready)
 # ============================================================
@@ -371,6 +493,7 @@ def run_agent(chat_id: str, user_message: str, phone_number: str | None = None) 
 #         resp = await client.post(url, headers=headers, json=payload)
 #         if resp.status_code != 200:
 #             print(f"Failed to send WhatsApp message: {resp.text}")
+
 
 # ============================================================
 # Background Task — WhatsApp channel
@@ -387,15 +510,17 @@ async def process_and_reply(phone_number: str, user_message: str):
         )
         print(f"[WhatsApp] Reply for {phone_number}: {final_answer[:100]}")
         # await send_whatsapp_message(phone_number, final_answer)
-        print(f"[WhatsApp] Send skipped (LOCAL MODE).")
-    except Exception as e:
+        print("[WhatsApp] Send skipped (LOCAL MODE).")
+    except Exception as exc:
         import traceback; traceback.print_exc()
-        print(f"[WhatsApp] Error for {phone_number}: {e}")
+        print(f"[WhatsApp] Error for {phone_number}: {exc}")
+
 
 # ============================================================
 # FastAPI App
 # ============================================================
 app = FastAPI(title="AgriGPT Agent")
+
 
 # ============================================================
 # WhatsApp Webhook Verification (GET)
@@ -404,7 +529,7 @@ app = FastAPI(title="AgriGPT Agent")
 async def verify_webhook(
     hub_mode:         str = Query(None, alias="hub.mode"),
     hub_verify_token: str = Query(None, alias="hub.verify_token"),
-    hub_challenge:    str = Query(None, alias="hub.challenge")
+    hub_challenge:    str = Query(None, alias="hub.challenge"),
 ):
     # WHATSAPP: replace hardcoded token with WHATSAPP_VERIFY_TOKEN env var when going live
     LOCAL_VERIFY_TOKEN = "test_verify_token_123"
@@ -412,6 +537,7 @@ async def verify_webhook(
         print("Webhook verified successfully.")
         return PlainTextResponse(content=hub_challenge, status_code=200)
     raise HTTPException(status_code=403, detail="Webhook verification failed.")
+
 
 # ============================================================
 # WhatsApp Webhook Handler (POST)
@@ -444,11 +570,12 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
         print(f"[Webhook] Message from {phone_number}: {user_message}")
         background_tasks.add_task(process_and_reply, phone_number, user_message)
 
-    except Exception as e:
+    except Exception as exc:
         import traceback; traceback.print_exc()
-        print(f"[Webhook] Parse error: {e}")
+        print(f"[Webhook] Parse error: {exc}")
 
     return {"status": "ok"}
+
 
 # ============================================================
 # Chat Endpoint — Web / Mobile Frontend
@@ -461,7 +588,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
 #   • Send chat_id + phone_number + message on every turn of that session.
 #   • On next "New Chat" click → generate a new UUID → fresh conversation.
 #
-# Backend behavior:
+# Backend behaviour:
 #   • New chat_id → no history found → agent starts completely fresh.
 #   • Same chat_id → history loaded → agent answers with full context.
 #   • MongoDB document created automatically on first message of a new chat.
@@ -471,45 +598,42 @@ class ChatRequest(BaseModel):
     phone_number: str   # user's phone number — stored as metadata
     message:      str   # user's message text
 
+
 class ChatResponse(BaseModel):
     chatId:       str
     phone_number: str
     response:     str
+
 
 @app.post("/test/chat", response_model=ChatResponse)
 def test_chat(request: ChatRequest):
     """
     Chat endpoint for web / mobile frontends.
 
-    Accepts all three required fields: chatId, phone_number, message.
-
     - chatId       → controls memory isolation (new UUID = blank slate)
-    - phone_number → stored as metadata; query all sessions for a user with:
-                     db.chat_sessions_v2.find({ phone_number: "911234567890" })
+    - phone_number → stored as metadata
     - message      → the user's input text
-
-    The agent receives the full stored history (up to 20 messages) as LLM
-    context so it can answer intelligently based on the entire conversation.
     """
     print(f"\n[/test/chat] chatId={request.chatId} | phone={request.phone_number} | msg={request.message}")
     try:
         final_answer = run_agent(
             chat_id=request.chatId,
             user_message=request.message,
-            phone_number=request.phone_number
+            phone_number=request.phone_number,
         )
         return ChatResponse(
             chatId=request.chatId,
             phone_number=request.phone_number,
-            response=final_answer
+            response=final_answer,
         )
-    except Exception as e:
+    except Exception as exc:
         import traceback; traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(exc))
+
 
 # ============================================================
 # Entry Point
 # ============================================================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8020)
+    uvicorn.run(app, host="0.0.0.0", port=8030)
