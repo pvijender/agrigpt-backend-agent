@@ -5,6 +5,12 @@ WhatsApp Business API (Meta Cloud API) Webhook Handler
 Connects to MULTIPLE MCP servers simultaneously (e.g. Alumnx + Vignan)
 and merges all their tools into one agent dynamically at startup.
 
+FALLBACK FEATURE:
+  - If tools don't find relevant information in knowledge base,
+    the agent makes a direct Gemini API call for the answer
+  - Source information is returned in the sources array
+  - Format: ["Knowledge Base: file1.pdf, file2.pdf"] or ["Not found in Knowledge Base. Used Gemini API"]
+
 New Chat flow:
   - Frontend generates a new UUID on "New Chat" click and sends it as chat_id.
   - Backend finds no history for that chat_id → agent starts fresh.
@@ -17,6 +23,7 @@ Auto Deploy enabled using deploy.yml file
 import os
 import httpx
 import asyncio
+import json
 from datetime import datetime, timezone
 from typing import Annotated, TypedDict, List, Dict, Any
 
@@ -51,14 +58,6 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 MCP_TIMEOUT    = float(os.getenv("MCP_TIMEOUT", "30"))
 
 # ── Multi-MCP Configuration ──────────────────────────────────────────────────
-# Each MCP server is configured via its own pair of env vars:
-#   <NAME>_MCP_URL      → base URL of that server
-#   <NAME>_MCP_API_KEY  → optional Bearer token (leave blank if not needed)
-#
-# The agent contacts ALL servers at startup, discovers their tools, and
-# merges everything into a single LangGraph agent automatically.
-# To add a third server later, just add its env vars and a new entry below.
-# ─────────────────────────────────────────────────────────────────────────────
 MCP_SERVERS: List[Dict[str, str]] = [
     {
         "name":    "Alumnx",
@@ -77,13 +76,7 @@ MONGODB_DB         = os.getenv("MONGODB_DB", "agrigpt")
 MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "chats")
 
 # Max messages stored per chat_id (human + AI combined = 10 full turns).
-# The LLM receives ALL stored messages as context on every invocation.
 MAX_MESSAGES = 20
-
-# WHATSAPP: Uncomment when Meta credentials are ready
-# WHATSAPP_VERIFY_TOKEN    = os.getenv("WHATSAPP_VERIFY_TOKEN")
-# WHATSAPP_ACCESS_TOKEN    = os.getenv("WHATSAPP_ACCESS_TOKEN")
-# WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
 
 # ============================================================
 # MongoDB Setup
@@ -92,9 +85,6 @@ mongo_client   = MongoClient(MONGODB_URI)
 db             = mongo_client[MONGODB_DB]
 chat_sessions: Collection = db[MONGODB_COLLECTION]
 
-# chat_id      → unique  (one document per conversation session)
-# phone_number → non-unique (one user can have many chat sessions)
-# updated_at   → for future TTL / cleanup
 chat_sessions.create_index([("chat_id",      ASCENDING)], unique=True)
 chat_sessions.create_index([("phone_number", ASCENDING)])
 chat_sessions.create_index([("updated_at",   ASCENDING)])
@@ -145,7 +135,6 @@ def save_history(chat_id: str, messages: list, phone_number: str | None = None):
       3. Upsert the document — creates it on first save (new chat),
          updates it on subsequent saves (continuing chat).
     """
-    # Step 1 — filter to storable human/ai messages only
     storable = []
     for msg in messages:
         if isinstance(msg, HumanMessage):
@@ -164,9 +153,7 @@ def save_history(chat_id: str, messages: list, phone_number: str | None = None):
                 joined = " ".join(t for t in text_parts if t.strip())
                 if joined.strip():
                     storable.append({"role": "ai", "content": joined})
-        # ToolMessage and other internal types are intentionally skipped
 
-    # Step 2 — pair-aware sliding window
     if len(storable) <= MAX_MESSAGES:
         window = storable
     else:
@@ -185,7 +172,6 @@ def save_history(chat_id: str, messages: list, phone_number: str | None = None):
 
         window = storable[cutoff_index:] if pairs_collected > 0 else storable[-MAX_MESSAGES:]
 
-    # Step 3 — upsert
     now = datetime.now(timezone.utc)
     update_fields: dict = {
         "messages":   window,
@@ -205,25 +191,42 @@ def save_history(chat_id: str, messages: list, phone_number: str | None = None):
 
 
 # ============================================================
+# Gemini Fallback Handler
+# ============================================================
+async def get_gemini_fallback_answer(user_question: str) -> str:
+    """
+    When knowledge base tools don't find information,
+    call Gemini directly for a general answer.
+    
+    Returns: The generated answer text
+    """
+    try:
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            temperature=0.7,  # Slightly higher for creative answers
+            google_api_key=GOOGLE_API_KEY,
+        )
+        
+        response = llm.invoke([
+            SystemMessage(content="""You are AgriGPT, an expert agricultural assistant.
+
+The user's question could not be found in the agricultural knowledge base.
+Provide a helpful general answer based on your training knowledge.
+Format the answer clearly without markdown asterisks."""),
+            HumanMessage(content=user_question)
+        ])
+        
+        answer_text = response.content if isinstance(response.content, str) else str(response.content)
+        return answer_text
+    except Exception as e:
+        print(f"[Gemini Fallback] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return "Sorry, I couldn't find information about your question in the knowledge base or generate a response. Please try rephrasing your question."
+
+
+# ============================================================
 # MCP Client — one instance per server
-#
-# Your MCP servers expose this custom REST API:
-#   GET  /list-tools  → {
-#                         "tools": [{
-#                           "name": "...",
-#                           "description": "...",
-#                           "parameters": {
-#                             "param_name": {
-#                               "type": "string",
-#                               "required": true/false,   ← inline bool, NOT a top-level array
-#                               "default": "...",
-#                               "description": "..."
-#                             }
-#                           }
-#                         }]
-#                       }
-#   POST /callTool    → { "name": "...", "arguments": {...} }
-#                     ← { "result": ... }
 # ============================================================
 class MCPClient:
     """REST client matching your MCP servers' custom endpoint format."""
@@ -239,12 +242,7 @@ class MCPClient:
     def list_tools(self) -> List[Dict[str, Any]]:
         """
         GET /list-tools and normalize the response into the internal format
-        that build_agent() expects:
-          { name, description, inputSchema: { properties: {...}, required: [...] } }
-
-        The server returns a flat "parameters" dict where each param carries
-        an inline "required" boolean. We convert that to a standard JSON Schema
-        shape so the rest of the agent code doesn't need to know about it.
+        that build_agent() expects.
         """
         print(f"[{self.name}] Fetching tools → {self.base_url}/list-tools")
         response = self.client.get(
@@ -266,7 +264,6 @@ class MCPClient:
                     "description": prop_details.get("description", ""),
                     "default":     prop_details.get("default", None),
                 }
-                # Server uses inline "required": true/false on each param
                 if prop_details.get("required", False):
                     required.append(prop_name)
 
@@ -298,7 +295,6 @@ class MCPClient:
 # ============================================================
 # Global Tool Results Storage
 # ============================================================
-# Store tool results during agent execution for source extraction
 global_tool_results = {}
 
 # ============================================================
@@ -306,7 +302,7 @@ global_tool_results = {}
 # ============================================================
 class State(TypedDict):
     messages: Annotated[list, add_messages]
-    tool_results: list  # Store tool results for source extraction
+    tool_results: list
 
 
 # ============================================================
@@ -330,12 +326,7 @@ def build_agent():
     ) -> StructuredTool:
         """
         Wrap a single remote MCP tool as a LangChain StructuredTool.
-        `client` and `tool_name` are captured explicitly via default
-        arguments so every tool dispatches to the correct server even
-        when created inside a loop.
-        
-        NOTE: The wrapped tool now returns the RAW dict result (not stringified)
-        so that tool_execution_node can extract sources properly.
+        Returns RAW dict result for proper source extraction.
         """
         properties      = input_schema.get("properties", {})
         required_fields = set(input_schema.get("required", []))
@@ -354,17 +345,13 @@ def build_agent():
 
         ArgsSchema = create_model(f"{tool_name}_args", **field_defs)
 
-        # Default-argument capture prevents late-binding bugs in loops
-        # IMPORTANT: Return the raw dict, not stringified, so source extraction works
         def remote_fn(_client=client, _name=tool_name, **kwargs) -> Any:
             cleaned = {k: v for k, v in kwargs.items() if v is not None}
             try:
                 result = _client.call_tool(_name, cleaned)
-                # Return as-is (dict) for proper source extraction
                 return result
             except Exception as exc:
                 import traceback; traceback.print_exc()
-                # Return error as dict structure for consistency
                 return {
                     "status": "error",
                     "message": f"[{_client.name}] MCP error calling '{_name}': {exc}",
@@ -391,7 +378,6 @@ def build_agent():
         try:
             remote_tools = client.list_tools()
         except Exception as exc:
-            # One unreachable server must NOT crash the whole agent at startup
             print(f"[{cfg['name']}] WARNING — could not reach server: {exc}")
             continue
 
@@ -400,7 +386,6 @@ def build_agent():
             description  = schema.get("description", "")
             input_schema = schema.get("inputSchema", {})
 
-            # Prefix with server name if two servers share the same tool name
             unique_name = raw_name
             if raw_name in seen_names:
                 unique_name = f"{cfg['name'].lower()}_{raw_name}"
@@ -437,7 +422,6 @@ def build_agent():
         last = state["messages"][-1]
         return "tools" if (hasattr(last, "tool_calls") and last.tool_calls) else END
 
-    # Custom tool execution node that captures results
     def tool_execution_node(state: State):
         """Execute tools and capture their results for source extraction."""
         global global_tool_results
@@ -454,14 +438,12 @@ def build_agent():
         tool_results_messages = []
         captured_results = []
         
-        # Execute each tool call
         for tool_call in last_message.tool_calls:
             tool_name = tool_call["name"]
             tool_input = tool_call.get("args", {})
             tool_id = tool_call.get("id", "")
             
             try:
-                # Find and execute the tool
                 tool_to_run = None
                 for tool in all_tools:
                     if tool.name == tool_name:
@@ -478,7 +460,6 @@ def build_agent():
                         if 'sources' in result:
                             print(f"[tool_execution] Found sources: {result['sources']}")
                     
-                    # Store in global and captured list
                     tool_result_item = {
                         'tool': tool_name,
                         'result': result,
@@ -486,16 +467,12 @@ def build_agent():
                     }
                     captured_results.append(tool_result_item)
                     
-                    # Also store globally for fallback
                     if tool_name not in global_tool_results:
                         global_tool_results[tool_name] = []
                     global_tool_results[tool_name].append(result)
                     
-                    # Create ToolMessage with stringified result
-                    import json
                     result_str = json.dumps(result) if isinstance(result, dict) else str(result)
                     
-                    # FIXED: Use tool_call_id instead of tool_use_id
                     tool_message = ToolMessage(
                         content=result_str,
                         tool_call_id=tool_id,
@@ -508,14 +485,12 @@ def build_agent():
                 print(f"[tool_execution] Error executing {tool_name}: {e}")
                 import traceback
                 traceback.print_exc()
-                # Return error in dict format for consistency with source extraction
                 error_result = {
                     "status": "error",
                     "message": str(e),
                     "sources": []
                 }
                 
-                # Store error result
                 tool_result_item = {
                     'tool': tool_name,
                     'result': error_result,
@@ -534,7 +509,6 @@ def build_agent():
                 )
                 tool_results_messages.append(tool_message)
         
-        # Preserve existing tool_results and add new ones
         all_tool_results = state.get("tool_results", []) + captured_results
         
         return {
@@ -576,18 +550,17 @@ def extract_final_answer(result: dict) -> str:
     return "No response generated."
 
 
-def run_agent(chat_id: str, user_message: str, phone_number: str | None = None) -> str:
+async def run_agent(chat_id: str, user_message: str, phone_number: str | None = None) -> Dict[str, Any]:
     """
-    Single entry point for agent execution across all channels (web, WhatsApp).
+    Single entry point for agent execution across all channels.
 
     Flow:
       1. Load history for chat_id from MongoDB.
-         - New chat_id → empty history → fresh conversation.
-         - Existing chat_id → full history → agent remembers previous context.
       2. Append the new human message.
       3. Invoke the LLM with the full message history as context.
-      4. Save updated history back to MongoDB (trimmed to MAX_MESSAGES).
-      5. Return the final text answer.
+      4. Check if knowledge base found relevant results.
+      5. Save updated history back to MongoDB.
+      6. Return answer + sources info.
     """
     print(f"[run_agent] chat_id={chat_id} | phone={phone_number} | msg={user_message[:60]}")
 
@@ -598,53 +571,46 @@ def run_agent(chat_id: str, user_message: str, phone_number: str | None = None) 
     if not history:
         history.append(SystemMessage(content="""You are AgriGPT, an expert agricultural assistant.
 
-    Provide clear, detailed, and well-formatted responses based on the available knowledge base.
-    Use proper formatting with sections and bullet points for readability.
-    Do NOT use markdown asterisks or special formatting characters."""))
+YOUR PRIMARY JOB: Call tools to retrieve information from the knowledge base.
+
+MANDATORY RULES (FOLLOW EXACTLY):
+1. EVERY question, you MUST call at least ONE tool first:
+   • sme_divesh: Agricultural knowledge, AI impact, farming practices
+   • pests_and_diseases: Crop diseases, pests, treatments
+   • govt_schemes: Government agricultural programs and schemes
+   • VignanUniversity: Academic agricultural research
+
+2. WAIT for tool results to come back.
+
+3. If tool results are EMPTY or contain "not found" or "no results":
+   - DO NOT answer from your training knowledge
+   - Tell the user: "Not found in knowledge base"
+   - Include this phrase EXACTLY in your response
+
+4. If tools return actual information:
+   - Answer ONLY based on that tool information
+
+5. Format answers clearly without markdown asterisks.
+
+CRITICAL: Never answer from your training data alone. Always call tools first.
+If tools have no results, say "Not found in knowledge base" in your response."""))
 
     history.append(HumanMessage(content=user_message))
 
-    result       = app_agent.invoke({"messages": history})
+    result = app_agent.invoke({
+        "messages": history,
+        "tool_results": []
+    })
+    
     final_answer = extract_final_answer(result)
 
     save_history(chat_id, result["messages"], phone_number=phone_number)
     print(f"[run_agent] Saved history. Answer: {final_answer[:80]}")
 
-    return final_answer
-
-
-# ============================================================
-# WhatsApp Sender (uncomment when Meta credentials are ready)
-# ============================================================
-# async def send_whatsapp_message(to_phone: str, message: str):
-#     url     = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-#     headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}", "Content-Type": "application/json"}
-#     payload = {"messaging_product": "whatsapp", "to": to_phone, "type": "text", "text": {"body": message}}
-#     async with httpx.AsyncClient(timeout=10.0) as client:
-#         resp = await client.post(url, headers=headers, json=payload)
-#         if resp.status_code != 200:
-#             print(f"Failed to send WhatsApp message: {resp.text}")
-
-
-# ============================================================
-# Background Task — WhatsApp channel
-# ============================================================
-async def process_and_reply(phone_number: str, user_message: str):
-    """
-    For WhatsApp: chat_id == phone_number (one persistent session per number).
-    Runs after 200 OK is returned to the WhatsApp webhook.
-    """
-    try:
-        loop         = asyncio.get_event_loop()
-        final_answer = await loop.run_in_executor(
-            None, run_agent, phone_number, user_message, phone_number
-        )
-        print(f"[WhatsApp] Reply for {phone_number}: {final_answer[:100]}")
-        # await send_whatsapp_message(phone_number, final_answer)
-        print("[WhatsApp] Send skipped (LOCAL MODE).")
-    except Exception as exc:
-        import traceback; traceback.print_exc()
-        print(f"[WhatsApp] Error for {phone_number}: {exc}")
+    return {
+        "answer": final_answer,
+        "tool_results": result.get("tool_results", [])
+    }
 
 
 # ============================================================
@@ -662,7 +628,6 @@ async def verify_webhook(
     hub_verify_token: str = Query(None, alias="hub.verify_token"),
     hub_challenge:    str = Query(None, alias="hub.challenge"),
 ):
-    # WHATSAPP: replace hardcoded token with WHATSAPP_VERIFY_TOKEN env var when going live
     LOCAL_VERIFY_TOKEN = "test_verify_token_123"
     if hub_mode == "subscribe" and hub_verify_token == LOCAL_VERIFY_TOKEN:
         print("Webhook verified successfully.")
@@ -709,174 +674,53 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
 
 
 # ============================================================
+# Background Task — WhatsApp channel
+# ============================================================
+async def process_and_reply(phone_number: str, user_message: str):
+    """
+    For WhatsApp: chat_id == phone_number (one persistent session per number).
+    """
+    try:
+        result = await run_agent(phone_number, user_message, phone_number)
+        final_answer = result["answer"]
+        print(f"[WhatsApp] Reply for {phone_number}: {final_answer[:100]}")
+        print("[WhatsApp] Send skipped (LOCAL MODE).")
+    except Exception as exc:
+        import traceback; traceback.print_exc()
+        print(f"[WhatsApp] Error for {phone_number}: {exc}")
+
+
+# ============================================================
 # Chat Endpoint — Web / Mobile Frontend
-#
-# Frontend contract:
-#   • On "New Chat" click → generate a fresh UUID and store it:
-#       const chatId = crypto.randomUUID()          // browser
-#       import { v4 as uuidv4 } from 'uuid'         // Node / React Native
-#
-#   • Send chat_id + phone_number + message on every turn of that session.
-#   • On next "New Chat" click → generate a new UUID → fresh conversation.
-#
-# Backend behaviour:
-#   • New chat_id → no history found → agent starts completely fresh.
-#   • Same chat_id → history loaded → agent answers with full context.
-#   • MongoDB document created automatically on first message of a new chat.
 # ============================================================
 class ChatRequest(BaseModel):
-    chatId:       str   # UUID generated by frontend — new UUID = new conversation
-    phone_number: str   # user's phone number — stored as metadata
-    message:      str   # user's message text
+    chatId:       str
+    phone_number: str
+    message:      str
 
 
 class ChatResponse(BaseModel):
     chatId:       str
     phone_number: str
     response:     str
-    sources:      List[str] = []  # List of PDF source names from Pinecone
-
-
-def extract_sources_from_result(result: Dict[str, Any]) -> List[str]:
-    """
-    Extract PDF source names from the agent result.
-    
-    Since the agent might not store ToolMessages in history,
-    we extract sources by:
-    1. Looking for source references in AIMessage content
-    2. Parsing JSON-encoded responses
-    3. Searching for PDF/document filenames in the final answer
-    
-    Returns: List of unique PDF filenames
-    """
-    sources = set()
-    
-    # Get the final answer text
-    final_answer = None
-    if "messages" in result:
-        # Get the last AIMessage (final answer)
-        for msg in reversed(result["messages"]):
-            if hasattr(msg, '__class__') and msg.__class__.__name__ == 'AIMessage':
-                if hasattr(msg, 'content'):
-                    final_answer = msg.content
-                    break
-    
-    if not final_answer:
-        print("[extract_sources] No final answer found")
-        return []
-    
-    # Parse the final answer - it might contain source info
-    answer_text = ""
-    if isinstance(final_answer, str):
-        answer_text = final_answer
-    elif isinstance(final_answer, list):
-        for block in final_answer:
-            if isinstance(block, dict) and 'text' in block:
-                answer_text += block['text']
-            elif isinstance(block, str):
-                answer_text += block
-    elif isinstance(final_answer, dict):
-        answer_text = str(final_answer)
-    
-    print(f"[extract_sources] Final answer length: {len(answer_text)} chars")
-    
-    # Strategy 1: Look for PDF filenames mentioned in the response
-    # Pattern: "filename.pdf" or filename.pdf in square brackets or parentheses
-    import re
-    
-    # Find all PDF files mentioned
-    pdf_pattern = r'[\w\s\-().]+\.pdf'
-    pdf_matches = re.findall(pdf_pattern, answer_text, re.IGNORECASE)
-    for pdf in pdf_matches:
-        pdf_clean = pdf.strip().strip('()[]').strip()
-        if pdf_clean and len(pdf_clean) > 4:  # At least "a.pdf"
-            sources.add(pdf_clean)
-            print(f"[extract_sources] Found PDF in answer: {pdf_clean}")
-    
-    # Strategy 2: Look for "Source:" or "Sources:" mentions
-    source_pattern = r'(?:Source|Sources|Document)s?:?\s*([^\n]+)'
-    source_matches = re.findall(source_pattern, answer_text, re.IGNORECASE)
-    for match in source_matches:
-        # Parse the match to extract filenames
-        items = [item.strip().strip('- •*').strip() for item in match.split(',')]
-        for item in items:
-            item = item.strip('()[]').strip()
-            if item and ('.pdf' in item.lower() or '.txt' in item.lower()):
-                sources.add(item)
-                print(f"[extract_sources] Found source in answer: {item}")
-    
-    # Strategy 3: Look for documents mentioned with extensions
-    doc_pattern = r'(?:document|file|pdf)(?:\s+(?:named|called|from))?\s*["\']?([^\s"\']+\.[a-z]+)["\']?'
-    doc_matches = re.findall(doc_pattern, answer_text, re.IGNORECASE)
-    for doc in doc_matches:
-        doc_clean = doc.strip().strip('()[]')
-        if doc_clean and any(doc_clean.lower().endswith(ext) for ext in ['.pdf', '.txt', '.doc', '.docx']):
-            sources.add(doc_clean)
-            print(f"[extract_sources] Found document: {doc_clean}")
-    
-    # Strategy 4: Extract from structured responses (if any JSON is in the answer)
-    try:
-        # Look for JSON-like structures
-        json_pattern = r'\{[^{}]*"(?:source|sources|document)s?"[^{}]*\}'
-        json_matches = re.findall(json_pattern, answer_text, re.IGNORECASE)
-        for json_str in json_matches:
-            try:
-                import json as json_module
-                parsed = json_module.loads(json_str)
-                if 'sources' in parsed:
-                    if isinstance(parsed['sources'], list):
-                        sources.update(parsed['sources'])
-                elif 'source' in parsed:
-                    sources.add(parsed['source'])
-            except:
-                pass
-    except:
-        pass
-    
-    # Clean and validate sources
-    valid_sources = []
-    for src in sources:
-        if src and isinstance(src, str):
-            src = src.strip().strip('()[]"\'')
-            # Keep files with document extensions
-            if any(src.lower().endswith(ext) for ext in ['.pdf', '.txt', '.doc', '.docx', '.xlsx', '.csv']):
-                valid_sources.append(src)
-    
-    final_sources = sorted(list(set(valid_sources)))
-    print(f"[extract_sources] Final extracted sources: {final_sources}")
-    
-    return final_sources
+    sources:      List[str] = []
 
 
 def extract_sources_from_tool_results(tool_results: List[Dict[str, Any]]) -> List[str]:
     """
-    Extract source filenames directly from tool execution results.
+    Extract source filenames from tool execution results.
     
-    Tool results structure can be:
-    [
-        {
-            'tool': 'pests_and_diseases',
-            'result': {
-                'status': 'success',
-                'sources': [
-                    {'filename': 'file1.pdf', 'chunk_id': '...', 'score': 0.8, 'text': '...'},
-                    {'filename': 'file2.pdf', 'chunk_id': '...', 'score': 0.78, 'text': '...'}
-                ]
-            }
-        }
-    ]
-    
-    Also handles stringified JSON results and alternative structures.
+    Returns either:
+    - List of PDF filenames if found in KB
+    - ["Not found in Knowledge Base. Used Gemini API"] if KB had no results
     """
     sources = set()
     
     if not tool_results:
-        print("[extract_sources_from_tool_results] No tool results provided")
+        print("[extract_sources] No tool results provided")
         return []
     
-    print(f"[extract_sources_from_tool_results] Processing {len(tool_results)} tool results")
-    
-    import json
+    print(f"[extract_sources] Processing {len(tool_results)} tool results")
     
     for tool_result in tool_results:
         if not isinstance(tool_result, dict):
@@ -886,87 +730,51 @@ def extract_sources_from_tool_results(tool_results: List[Dict[str, Any]]) -> Lis
         result_data = tool_result.get("result")
         
         if not result_data:
-            print(f"[extract_sources_from_tool_results] {tool_name}: No result data")
+            print(f"[extract_sources] {tool_name}: No result data")
             continue
         
-        # Handle stringified JSON results (when they come from ToolMessage content)
+        # Handle stringified JSON results
         if isinstance(result_data, str):
-            print(f"[extract_sources_from_tool_results] {tool_name}: Result is string, parsing JSON...")
             try:
                 result_data = json.loads(result_data)
-                print(f"[extract_sources_from_tool_results] {tool_name}: Successfully parsed JSON")
             except:
-                print(f"[extract_sources_from_tool_results] {tool_name}: Could not parse as JSON, skipping")
+                print(f"[extract_sources] {tool_name}: Could not parse as JSON")
                 continue
         
         if not isinstance(result_data, dict):
-            print(f"[extract_sources_from_tool_results] {tool_name}: Result is not a dict after parsing")
             continue
         
-        print(f"[extract_sources_from_tool_results] {tool_name}:")
-        
-        # Extract from "sources" field (NEW: handles dict format with 'filename' key)
+        # Extract from "sources" field
         if "sources" in result_data:
             src_list = result_data["sources"]
             if isinstance(src_list, list):
-                print(f"  Found 'sources' with {len(src_list)} items")
                 for src in src_list:
-                    # Handle dict format: {'filename': 'file.pdf', 'chunk_id': '...', 'score': 0.8, ...}
-                    if isinstance(src, dict):
-                        if "filename" in src:
-                            filename = src["filename"]
-                            if filename and isinstance(filename, str):
-                                filename = filename.strip()
-                                if filename:
-                                    sources.add(filename)
-                                    print(f"    → {filename}")
-                    # Handle plain string format: 'file.pdf'
+                    if isinstance(src, dict) and "filename" in src:
+                        filename = src["filename"]
+                        if filename and isinstance(filename, str):
+                            sources.add(filename.strip())
                     elif isinstance(src, str) and src.strip():
                         sources.add(src.strip())
-                        print(f"    → {src.strip()}")
         
-        # Extract from "results" field with source subfield
+        # Extract from "results" field
         if "results" in result_data:
             res_list = result_data["results"]
             if isinstance(res_list, list):
-                print(f"  Found 'results' with {len(res_list)} items")
                 for res in res_list:
                     if isinstance(res, dict) and "source" in res:
                         src = res["source"]
                         if isinstance(src, str) and src.strip():
                             sources.add(src.strip())
-                            print(f"    → {src}")
-        
-        # Extract from "data" or "documents" fields (alternative structures)
-        if "data" in result_data and isinstance(result_data["data"], list):
-            print(f"  Found 'data' field with {len(result_data['data'])} items")
-            for item in result_data["data"]:
-                if isinstance(item, dict) and "source" in item:
-                    src = item["source"]
-                    if isinstance(src, str) and src.strip():
-                        sources.add(src.strip())
-                        print(f"    → {src}")
     
-    # Remove duplicates and sort
     final_sources = sorted(list(sources))
-    print(f"[extract_sources_from_tool_results] FINAL: {final_sources}")
+    print(f"[extract_sources] Found {len(final_sources)} sources")
+    
     return final_sources
 
 
 def clean_response_text(text: str) -> str:
     """
     Clean and format the response text.
-    
-    Removes:
-    - Asterisks (**, *, etc.) used for markdown formatting
-    - 📚 Sources: section and sources (handled separately now)
-    - Escaped newlines (\\n) and converts them to actual newlines
-    
-    Args:
-        text: Raw response text from the LLM
-    
-    Returns:
-        Cleaned, properly formatted text
     """
     if not text:
         return ""
@@ -977,135 +785,92 @@ def clean_response_text(text: str) -> str:
     # Convert escaped newlines to actual newlines
     cleaned = cleaned.replace("\\n", "\n")
     
-    # Remove the "Sources:" section that was appended by the system prompt
-    # (sources are now extracted separately)
+    # Remove source sections if any
     if "📚 Sources:" in cleaned or "Sources:" in cleaned:
-        # Find the start of sources section
         if "📚 Sources:" in cleaned:
             cleaned = cleaned.split("📚 Sources:")[0]
         else:
             cleaned = cleaned.split("Sources:")[0]
     
-    # Clean up extra whitespace
     cleaned = cleaned.strip()
     
     return cleaned
 
 
 @app.post("/test/chat", response_model=ChatResponse)
-def test_chat(request: ChatRequest):
+async def test_chat(request: ChatRequest):
     """
     Chat endpoint for web / mobile frontends.
-
-    - chatId       → controls memory isolation (new UUID = blank slate)
-    - phone_number → stored as metadata
-    - message      → the user's input text
     
-    Response includes:
-    - response     → cleaned, formatted text answer
-    - sources      → list of PDF filenames extracted from tool results
+    Returns response with sources array containing either:
+    - List of PDF files (if found in KB)
+    - ["Not found in Knowledge Base. Used Gemini API"] if KB didn't find answer
     """
     global global_tool_results
     
     print(f"\n[/test/chat] chatId={request.chatId} | phone={request.phone_number} | msg={request.message}")
     try:
-        # Clear previous tool results for this request
         global_tool_results.clear()
         
-        # Load history first
-        history = load_history(request.chatId)
-        print(f"[/test/chat] Loaded {len(history)} messages from history.")
+        # Run agent
+        agent_result = await run_agent(
+            request.chatId,
+            request.message,
+            request.phone_number
+        )
         
-        # IMPORTANT: Always ensure system prompt is first in history
-        # to guide the agent to use tools
-        system_prompt = SystemMessage(content="""You are AgriGPT, an expert agricultural assistant.
-
-YOUR PRIMARY JOB: Call tools to retrieve information, then answer based on that.
-
-MANDATORY RULES - FOLLOW EXACTLY:
-1. Before answering ANY question, you MUST call at least ONE of these tools:
-   • sme_divesh: Agricultural knowledge, AI impact, farming practices
-   • pests_and_diseases: Crop diseases, pests, treatments
-   • govt_schemes: Government agricultural programs and schemes
-   • VignanUniversity: Academic agricultural research and information
-
-2. WAIT for tool results. Use ONLY tool results to answer.
-
-3. NEVER answer from your training data alone.
-
-4. ALWAYS mention which tool(s) provided your information.
-
-5. Format clearly without markdown asterisks.
-
-CRITICAL: Every response must include tool calls. If you don't call a tool, you are failing your job.
-
-Example:
-User: "Tell me about AI in agriculture"
-→ You: Call sme_divesh tool with query
-→ Wait for results
-→ Answer based on tool results only
-→ Say: "According to sme_divesh tool..."
-
-DO THIS EVERY TIME. NO EXCEPTIONS.""")
-        
-        # Remove any existing system messages and add fresh one
-        history = [msg for msg in history if not isinstance(msg, SystemMessage)]
-        history = [system_prompt] + history
-        
-        history.append(HumanMessage(content=request.message))
-        
-        # Invoke the agent
-        print("[/test/chat] Invoking agent...")
-        result = app_agent.invoke({
-            "messages": history,
-            "tool_results": []  # Initialize tool_results in state
-        })
-        print(f"[/test/chat] Agent returned {len(result['messages'])} messages")
-        
-        # Debug: Print message types and tool_calls
-        for i, msg in enumerate(result["messages"]):
-            msg_type = type(msg).__name__
-            print(f"  Message {i}: {msg_type}", end="")
-            
-            if hasattr(msg, "tool_calls") and msg.tool_calls:
-                print(f" → TOOL_CALLS: {[tc.get('name') for tc in msg.tool_calls]}")
-            elif hasattr(msg, "content") and msg_type == "AIMessage":
-                content_preview = str(msg.content)[:80]
-                print(f" → Content: {content_preview}...")
-            else:
-                print()
-        
-        final_answer = extract_final_answer(result)
-        
-        # Save history
-        save_history(request.chatId, result["messages"], phone_number=request.phone_number)
+        final_answer = agent_result["answer"]
+        tool_results = agent_result.get("tool_results", [])
         
         # Extract sources from tool results
         print("[/test/chat] Extracting sources...")
         sources = []
         
-        # Strategy 1: Try to get from result state
-        if "tool_results" in result and result["tool_results"]:
-            print(f"[/test/chat] Found {len(result['tool_results'])} tool results in state")
-            sources = extract_sources_from_tool_results(result["tool_results"])
-        
-        # Strategy 2: Fallback to global storage
-        if not sources and global_tool_results:
-            print(f"[/test/chat] Fallback: Using global_tool_results with {len(global_tool_results)} tools")
-            # Convert global format to tool_results format
+        # Check if KB found any results
+        kb_found = False
+        if tool_results:
+            # Convert to proper format
             fallback_results = []
-            for tool_name, results_list in global_tool_results.items():
-                for result_data in results_list:
-                    fallback_results.append({
-                        'tool': tool_name,
-                        'result': result_data
-                    })
+            for tool_result in tool_results:
+                fallback_results.append(tool_result)
+            
             sources = extract_sources_from_tool_results(fallback_results)
+            if sources:
+                kb_found = True
         
-        # Clean and format the response text
+        # If KB didn't find anything, check if answer contains "not found"
+        if not kb_found and ("not found" in final_answer.lower() or 
+                             "not available" in final_answer.lower() or 
+                             "no information" in final_answer.lower()):
+            # Call Gemini fallback
+            print("[/test/chat] KB didn't find answer, calling Gemini fallback...")
+            gemini_answer = await get_gemini_fallback_answer(request.message)
+            # Prepend the disclaimer message
+            final_answer = f"Sorry not found in knowledge base but I can use Gemini API to answer your question\n\n{gemini_answer}"
+            sources = ["Gemini"]
+        elif not sources and ("not found" in final_answer.lower() or 
+                              "not available" in final_answer.lower() or
+                              "no results" in final_answer.lower() or
+                              "no data" in final_answer.lower()):
+            # KB tools were called but returned nothing
+            print("[/test/chat] KB tools returned no results, calling Gemini...")
+            gemini_answer = await get_gemini_fallback_answer(request.message)
+            # Prepend the disclaimer message
+            final_answer = f"Sorry not found in knowledge base but I can use Gemini API to answer your question\n\n{gemini_answer}"
+            sources = ["Gemini"]
+        elif not sources and not kb_found:
+            # Tools were called but returned no meaningful results
+            # This catches cases where agent answers without calling tools or tools return empty
+            print("[/test/chat] KB didn't return sources, using Gemini fallback...")
+            gemini_answer = await get_gemini_fallback_answer(request.message)
+            # Prepend the disclaimer message
+            final_answer = f"Sorry not found in knowledge base but I can use Gemini API to answer your question\n\n{gemini_answer}"
+            sources = ["Gemini"]
+        
+        # Clean response
         cleaned_response = clean_response_text(final_answer)
         
-        print(f"[/test/chat] ✓ FINAL SOURCES: {sources}")
+        print(f"[/test/chat] Final sources: {sources}")
         print(f"[/test/chat] Response length: {len(cleaned_response)} chars")
         
         return ChatResponse(
