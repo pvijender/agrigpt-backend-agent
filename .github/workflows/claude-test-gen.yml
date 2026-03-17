@@ -6,14 +6,15 @@ on:
     paths:
       - "**.py"
 
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
 jobs:
   generate-and-run:
     name: Update CLAUDE.md → Generate Tests → Run → Fix
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-      id-token: write
 
     steps:
       - name: Checkout PR branch
@@ -27,7 +28,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          direct_prompt: |
+          prompt: |
             Read app.py and CLAUDE.md.
 
             First, update the "Specific test cases required" section in CLAUDE.md:
@@ -63,7 +64,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          direct_prompt: |
+          prompt: |
             The pytest run failed. Read test_output.txt and tests/test_app.py.
             Fix tests/test_app.py so all tests pass, following the Test Strategy rules in CLAUDE.md.
             Do not weaken or remove tests — fix the test code itself.
