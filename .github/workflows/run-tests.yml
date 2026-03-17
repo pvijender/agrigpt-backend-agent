@@ -23,4 +23,9 @@ jobs:
         run: pip install pytest pytest-asyncio httpx pytest-mock
 
       - name: Run tests
-        run: pytest tests/ -v --tb=short
+        run: |
+          if [ ! -d "tests" ]; then
+            echo "No tests/ directory yet — skipping. Open a PR to have Claude generate tests."
+            exit 0
+          fi
+          pytest tests/ -v --tb=short
