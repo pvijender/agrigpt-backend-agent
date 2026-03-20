@@ -134,3 +134,5 @@ Main chat endpoint for web and mobile frontends.
   "phone_number": "911234567890",
   "message":      "Which crops are best for black soil?"
 }
+
+As minor change has been made here
